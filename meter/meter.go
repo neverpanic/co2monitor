@@ -1,10 +1,6 @@
 package meter
 
 import (
-	"os"
-	"syscall"
-	"unsafe"
-
 	"log"
 	"math"
 
@@ -12,20 +8,22 @@ import (
 
 	"sync/atomic"
 
+	"github.com/karalabe/hid"
 	"github.com/pkg/errors"
 )
 
 const (
-	meterTemp       byte    = 0x42
-	meterCO2        byte    = 0x50
-	hidiocsfeature9 uintptr = 0xc0094806
+	meterTemp    byte   = 0x42
+	meterCO2     byte   = 0x50
+	usbVendorID  uint16 = 0x04d9
+	usbProductID uint16 = 0xa052
 )
 
 var key = [8]byte{}
 
 // Meter gives access to the CO2 Meter. Make sure to call Open before Read.
 type Meter struct {
-	file   *os.File
+	device *hid.Device
 	opened int32
 }
 
@@ -35,18 +33,25 @@ type Measurement struct {
 	Co2         int
 }
 
+type HidDeviceInfo = hid.DeviceInfo
+
+// Enumerate will return a list of DeviceInfo structures that can be passed to
+// Open()
+func Enumerate() []HidDeviceInfo {
+	return hid.Enumerate(usbVendorID, usbProductID)
+}
+
 // Open will open the device file specified in the path which is usually something like /dev/hidraw2.
-func (m *Meter) Open(path string) (err error) {
+func (m *Meter) Open(info HidDeviceInfo) (err error) {
 	atomic.StoreInt32(&m.opened, 1)
 	m.initKey()
 
-	m.file, err = os.OpenFile(path, os.O_RDWR, 0644)
-
-	if err != nil || m.file == nil {
-		return errors.Wrapf(err, "Failed to open '%v'", path)
+	m.device, err = info.Open()
+	if err != nil || m.device == nil {
+		return errors.Wrapf(err, "Failed to open device at path '%v'", info.Path)
 	}
 
-	log.Printf("Device '%v' opened", m.file.Name())
+	log.Printf("Device at path '%v' opened", m.device.Path)
 	return m.ioctl()
 }
 
@@ -62,12 +67,13 @@ func (m *Meter) initKey() {
 // ioctl writes into the device file. We need to write 9 bytes where the first byte specifies the report number.
 // In this case 0x00.
 func (m *Meter) ioctl() error {
-	data := [9]byte{}
+	data := make([]byte, 9)
 	copy(data[1:], key[0:]) // remember, first byte needs to be 0
-	_, _, err := syscall.Syscall(syscall.SYS_IOCTL, m.file.Fd(), hidiocsfeature9, uintptr(unsafe.Pointer(&data)))
+	_, err := m.device.SendFeatureReport(data)
 
-	if err != 0 {
-		return errors.Wrap(syscall.Errno(err), "ioctl failed")
+	if err != nil {
+		return errors.Wrapf(err, "Failed to send feature report '%x' to device at path '%v'",
+			data, m.device.Path)
 	}
 	return nil
 }
@@ -83,9 +89,12 @@ func (m *Meter) Read() (*Measurement, error) {
 	measurement := &Measurement{Co2: 0, Temperature: -273.15}
 
 	for {
-		_, err := m.file.Read(result)
+		length, err := m.device.Read(result)
 		if err != nil {
-			return nil, errors.Wrapf(err, "Could not read from: '%v'", m.file.Name())
+			return nil, errors.Wrapf(err, "Could not read from device at path '%v'", m.device.Path)
+		}
+		if length != len(result) {
+			return nil, errors.Errorf("Short read from device at path '%v'", m.device.Path)
 		}
 
 		decrypted := m.decrypt(result)
@@ -140,7 +149,7 @@ func (m *Meter) decrypt(data []byte) []uint {
 
 // Close will close the device file.
 func (m *Meter) Close() error {
-	log.Printf("Closing '%v'", m.file.Name())
+	log.Printf("Closing device at path '%v'", m.device.Path)
 	atomic.StoreInt32(&m.opened, 0)
-	return m.file.Close()
+	return m.device.Close()
 }
